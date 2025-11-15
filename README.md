@@ -113,3 +113,28 @@ paper ☺️.
 This repository is distributed under the terms of the GLPv3
 license. See the [LICENSE](./LICENSE) file for more details, or visit
 the [GPLv3 homepage](https://www.gnu.org/licenses/gpl-3.0.en.html).
+
+## Continual Model Merging
+
+This repository supports continual model merging, allowing you to merge a base model with models trained on sequential tasks by averaging their parameters.
+
+### Usage
+
+To merge models using the `SimpleAgent` architecture, run:
+
+```bash
+python experiments/meta-world/run_continual_merge.py \
+  --base agents/task_1__simple__run_sac__1/ \
+  --tasks agents/task_2__simple__run_sac__1/ \
+  --output agents/merged_simple/ \
+  --obs_dim <OBS_DIM> \
+  --act_dim <ACT_DIM>
+```
+
+- Replace `<OBS_DIM>` and `<ACT_DIM>` with the correct observation and action dimensions for your environment.
+- The script will check that all provided directories contain a `model.pt` file.
+- The merged model will be saved in the specified output directory.
+
+### Implementation
+
+The merging logic is implemented in [`experiments/meta-world/models/continual_merge.py`](experiments/meta-world/models/continual_merge.py:1) and can be reused in other scripts.

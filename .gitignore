@@ -3,3 +3,10 @@
 *runs*
 experiments/atari/data
 experiments/meta-world/data
+
+*.out
+*.pt
+
+*.err
+
+*.log

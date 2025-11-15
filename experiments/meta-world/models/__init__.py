@@ -3,3 +3,4 @@ from .simple import SimpleAgent
 from .compo import CompoNetAgent
 from .packnet import PackNetAgent
 from .prognet import ProgressiveNetAgent
+from .sequential_merge import SequentialMergeAgent

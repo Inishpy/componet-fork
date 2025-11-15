@@ -15,13 +15,14 @@ import pathlib
 from torch.utils.tensorboard import SummaryWriter
 from typing import Literal, Optional, Tuple
 from models import shared, SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent
+from models.sequential_merge import SequentialMergeAgent
 from tasks import get_task, get_task_name
 from stable_baselines3.common.buffers import ReplayBuffer
 
 
 @dataclass
 class Args:
-    model_type: Literal["simple", "finetune", "componet", "packnet", "prognet"]
+    model_type: Literal["simple", "finetune", "componet", "packnet", "prognet", "sequential-merge"]
     """The name of the NN model to use for the agent"""
     save_dir: Optional[str] = None
     """If provided, the model will be saved in the given directory"""
@@ -44,6 +45,8 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    num_envs: int = 1
+    """Number of parallel environments to use"""
 
     # Algorithm specific arguments
     task_id: int = 0
@@ -96,8 +99,8 @@ class SoftQNetwork(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.fc = shared(
-            np.array(envs.observation_space.shape).prod()
-            + np.prod(envs.action_space.shape)
+            np.array(envs.single_observation_space.shape).prod()
+            + np.prod(envs.single_action_space.shape)
         )
         self.fc_out = nn.Linear(256, 1)
 
@@ -166,7 +169,7 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
     for _ in range(num_evals):
         while True:
             obs = torch.Tensor(obs).to(device).unsqueeze(0)
-            action, _ = agent(obs)
+            _, _, action = agent.get_action(obs)
             obs, reward, termination, truncation, info = test_env.step(
                 action[0].cpu().numpy()
             )
@@ -185,6 +188,7 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
     print(f"\nTEST: ep_ret={avg_ep_ret}, success={avg_success}\n")
     writer.add_scalar("charts/test_episodic_return", avg_ep_ret, global_step)
     writer.add_scalar("charts/test_success", avg_success, global_step)
+    return avg_ep_ret, avg_success
 
 
 if __name__ == "__main__":
@@ -220,7 +224,8 @@ if __name__ == "__main__":
     print(f"*** Device: {device}")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(args.task_id)])
+    num_envs = args.num_envs
+    envs = gym.vector.AsyncVectorEnv([make_env(args.task_id) for _ in range(num_envs)])
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
@@ -276,6 +281,10 @@ if __name__ == "__main__":
             prev_paths=args.prev_units,
             map_location=device,
         ).to(device)
+    elif args.model_type == "sequential-merge":
+        # Sequential-merge: for each task, always train a new model first, then merge after training
+        model = SimpleAgent(obs_dim=obs_dim, act_dim=act_dim).to(device)
+
 
     actor = Actor(envs, model).to(device)
     qf1 = SoftQNetwork(envs).to(device)
@@ -292,7 +301,7 @@ if __name__ == "__main__":
     # Automatic entropy tuning
     if args.autotune:
         target_entropy = -torch.prod(
-            torch.Tensor(envs.action_space.shape).to(device)
+            torch.Tensor(envs.single_action_space.shape).to(device)
         ).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
@@ -306,6 +315,7 @@ if __name__ == "__main__":
         envs.single_observation_space,
         envs.single_action_space,
         device,
+        n_envs=num_envs,
         handle_timeout_termination=False,
     )
 
@@ -313,11 +323,13 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    for global_step in range(args.total_timesteps):
+    global_step = 0
+    total_update_steps = 0
+    while global_step < args.total_timesteps:
         # ALGO LOGIC: put action logic here
         if global_step < args.random_actions_end:
             actions = np.array(
-                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
+                [envs.single_action_space.sample() for _ in range(num_envs)]
             )
         else:
             if args.model_type == "componet" and global_step % 1000 == 0:
@@ -333,21 +345,7 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for i, info in enumerate(infos["final_info"]):
-                print(
-                    f"global_step={global_step}, episodic_return={info['episode']['r']}, success={info['success']}"
-                )
-                writer.add_scalar(
-                    "charts/episodic_return", info["episode"]["r"], global_step
-                )
-                writer.add_scalar(
-                    "charts/episodic_length", info["episode"]["l"], global_step
-                )
-                writer.add_scalar("charts/success", info["success"], global_step)
-
-                break
+        global_step += num_envs
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
@@ -359,79 +357,94 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
+        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        if "final_info" in infos:
+            for info in infos["final_info"]:
+                if info and "episode" in info:
+                    print(
+                        f"global_step={global_step}, episodic_return={info['episode']['r']}, success={info['success']}"
+                    )
+                    writer.add_scalar(
+                        "charts/episodic_return", info["episode"]["r"], global_step
+                    )
+                    writer.add_scalar(
+                        "charts/episodic_length", info["episode"]["l"], global_step
+                    )
+                    writer.add_scalar("charts/success", info["success"], global_step)
+
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(
-                    data.next_observations
-                )
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = (
-                    torch.min(qf1_next_target, qf2_next_target)
-                    - alpha * next_state_log_pi
-                )
-                next_q_value = data.rewards.flatten() + (
-                    1 - data.dones.flatten()
-                ) * args.gamma * (min_qf_next_target).view(-1)
-
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = qf2(data.observations, data.actions).view(-1)
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
-
-            # optimize the model
-            q_optimizer.zero_grad()
-            qf_loss.backward()
-            q_optimizer.step()
-
-            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
-                for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
-
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    if args.model_type == "packnet":
-                        if global_step >= packnet_retrain_start:
-                            # can be called multiple times, only the first counts
-                            actor.model.start_retraining()
-                        actor.model.before_update()
-                    actor_optimizer.step()
-
-                    if args.autotune:
-                        with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
-                        alpha_loss = (
-                            -log_alpha.exp() * (log_pi + target_entropy)
-                        ).mean()
-
-                        a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        a_optimizer.step()
-                        alpha = log_alpha.exp().item()
-
-            # update the target networks
-            if global_step % args.target_network_frequency == 0:
-                for param, target_param in zip(
-                    qf1.parameters(), qf1_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
+            for gradient_step in range(num_envs):
+                total_update_steps += 1
+                data = rb.sample(args.batch_size)
+                with torch.no_grad():
+                    next_state_actions, next_state_log_pi, _ = actor.get_action(
+                        data.next_observations
                     )
-                for param, target_param in zip(
-                    qf2.parameters(), qf2_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
+                    qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+                    qf2_next_target = qf2_target(data.next_observations, next_state_actions)
+                    min_qf_next_target = (
+                        torch.min(qf1_next_target, qf2_next_target)
+                        - alpha * next_state_log_pi
                     )
+                    next_q_value = data.rewards.flatten() + (
+                        1 - data.dones.flatten()
+                    ) * args.gamma * (min_qf_next_target).view(-1)
+
+                qf1_a_values = qf1(data.observations, data.actions).view(-1)
+                qf2_a_values = qf2(data.observations, data.actions).view(-1)
+                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                qf_loss = qf1_loss + qf2_loss
+
+                # optimize the model
+                q_optimizer.zero_grad()
+                qf_loss.backward()
+                q_optimizer.step()
+
+                if total_update_steps % args.policy_frequency == 0:
+                    for _ in range(args.policy_frequency):
+                        pi, log_pi, _ = actor.get_action(data.observations)
+                        qf1_pi = qf1(data.observations, pi)
+                        qf2_pi = qf2(data.observations, pi)
+                        min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                        actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+
+                        actor_optimizer.zero_grad()
+                        actor_loss.backward()
+                        if args.model_type == "packnet":
+                            if global_step >= packnet_retrain_start:
+                                # can be called multiple times, only the first counts
+                                actor.model.start_retraining()
+                            actor.model.before_update()
+                        actor_optimizer.step()
+
+                        if args.autotune:
+                            with torch.no_grad():
+                                _, log_pi, _ = actor.get_action(data.observations)
+                            alpha_loss = (
+                                -log_alpha.exp() * (log_pi + target_entropy)
+                            ).mean()
+
+                            a_optimizer.zero_grad()
+                            alpha_loss.backward()
+                            a_optimizer.step()
+                            alpha = log_alpha.exp().item()
+
+                # update the target networks
+                if total_update_steps % args.target_network_frequency == 0:
+                    for param, target_param in zip(
+                        qf1.parameters(), qf1_target.parameters()
+                    ):
+                        target_param.data.copy_(
+                            args.tau * param.data + (1 - args.tau) * target_param.data
+                        )
+                    for param, target_param in zip(
+                        qf2.parameters(), qf2_target.parameters()
+                    ):
+                        target_param.data.copy_(
+                            args.tau * param.data + (1 - args.tau) * target_param.data
+                        )
 
             if global_step % 100 == 0:
                 writer.add_scalar(
@@ -456,10 +469,32 @@ if __name__ == "__main__":
                         "losses/alpha_loss", alpha_loss.item(), global_step
                     )
 
-    [
-        eval_agent(actor, envs.envs[i], args.num_evals, global_step, writer, device)
-        for i in range(envs.num_envs)
-    ]
+    # --- Sequential-merge post-training merge logic ---
+    if args.model_type == "sequential-merge" and args.task_id > 0 and len(args.prev_units) > 0:
+        from models.sequential_merge import weighted_average_merge
+        from models.simple import SimpleAgent
+
+        print("[SEQUENTIAL-MERGE] Loading previous model for merging ...", args.prev_units)
+        prev_model = SimpleAgent.load(args.prev_units[0], map_location=device, reset_heads=False).to(device)
+        print("[SEQUENTIAL-MERGE] Merging previous and current (trained) model with weighted average ...")
+        merged_model = weighted_average_merge(prev_model, actor.model, weight_new=0.6)
+        # Optionally: retrain merged_model here if desired
+        actor.model.load_state_dict(merged_model.state_dict())
+
+    # Evaluate on all previous tasks and print/average results
+    all_returns = []
+    all_successes = []
+    print("\n=== Evaluation on all previous tasks ===")
+    for tid in range(args.task_id+1):
+        test_env = make_env(tid)()
+        ep_ret, success = eval_agent(actor, test_env, args.num_evals, global_step, writer, device)
+        print(f"Task {tid}: ep_ret={ep_ret:.2f}, success={success:.2f}")
+        all_returns.append(ep_ret)
+        all_successes.append(success)
+        test_env.close()
+    avg_ret = np.mean(all_returns)
+    avg_success = np.mean(all_successes)
+    print(f"\nAverage over all tasks: ep_ret={avg_ret:.2f}, success={avg_success:.2f}\n")
 
     envs.close()
     writer.close()
@@ -467,3 +502,8 @@ if __name__ == "__main__":
     if args.save_dir is not None:
         print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
         actor.model.save(dirname=f"{args.save_dir}/{run_name}")
+
+    # Log training duration
+    end_time = time.time()
+    elapsed = end_time - start_time
+    print(f"Training took {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")

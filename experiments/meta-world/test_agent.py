@@ -14,7 +14,7 @@ def parse_args():
 
     # fmt: off
     parser.add_argument("--load", type=str, required=True)
-    parser.add_argument("--task-id", type=int, required=False, default=None)
+    parser.add_argument("--task-id", type=int, required=False, default=None)#give the directory path not the model path itself
     parser.add_argument("--seed", type=int, required=False, default=None)
     parser.add_argument("--num-episodes", type=int, default=10)
     parser.add_argument('--render', default=False, action='store_true')
@@ -26,7 +26,9 @@ def parse_args():
 
 def parse_load_name(path):
     name = os.path.basename(path)
+    
     s = name.split("__")
+    
     method = s[1]
     seed = int(s[-1])
     task = int(s[0].split("_")[-1])
