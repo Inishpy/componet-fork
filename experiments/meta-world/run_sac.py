@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
 import random
@@ -471,13 +472,15 @@ if __name__ == "__main__":
 
     # --- Sequential-merge post-training merge logic ---
     if args.model_type == "sequential-merge" and args.task_id > 0 and len(args.prev_units) > 0:
-        from models.sequential_merge import weighted_average_merge
+        from models.sequential_merge import dop_merge_simple
         from models.simple import SimpleAgent
 
         print("[SEQUENTIAL-MERGE] Loading previous model for merging ...", args.prev_units)
         prev_model = SimpleAgent.load(args.prev_units[0], map_location=device, reset_heads=False).to(device)
-        print("[SEQUENTIAL-MERGE] Merging previous and current (trained) model with weighted average ...")
-        merged_model = weighted_average_merge(prev_model, actor.model, weight_new=0.6)
+        print("[SEQUENTIAL-MERGE] Merging previous and current (trained) model with DOP merge ...")
+        # Theta0: you need a base pretrained model. If not available use prev_model as a proxy.
+        Theta0 = prev_model  # replace with actual base pretrained if you have it
+        merged_model = dop_merge_simple(Theta0, prev_model, actor.model, K=30, r=16, beta=0.95, eta=1e-3)
         # Optionally: retrain merged_model here if desired
         actor.model.load_state_dict(merged_model.state_dict())
 

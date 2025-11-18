@@ -58,6 +58,126 @@ def weighted_average_merge(model_a, model_b, weight_new=0.6):
 
 
 
+# models/sequential_merge.py
+import copy
+import torch
+import torch.nn as nn
+
+def _top_r_svd(mat, r):
+    if torch.norm(mat) == 0:
+        m, n = mat.shape
+        return (torch.zeros((m, min(r, n)), device=mat.device, dtype=mat.dtype),
+                torch.zeros((min(r, n),), device=mat.device, dtype=mat.dtype),
+                torch.zeros((n, min(r, n)), device=mat.device, dtype=mat.dtype))
+    U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
+    r = min(r, S.numel())
+    return U[:, :r], S[:r], Vh[:r, :].T
+
+def _project_onto_svd_subspace(X, U, V):
+    # U: (m,r), V: (n,r), X: (m,n)
+    if U.numel() == 0 or V.numel() == 0:
+        return torch.zeros_like(X)
+    coeffs = torch.einsum('ir,ij,jr->r', U, X, V)
+    proj = torch.zeros_like(X)
+    for i in range(U.shape[1]):
+        ui = U[:, i].unsqueeze(1)
+        vi = V[:, i].unsqueeze(1)
+        proj = proj + coeffs[i] * (ui @ vi.T)
+    return proj
+
+def dop_merge_simple(
+    Theta0,         # base pretrained model (nn.Module)
+    Theta_old,      # previously merged / main model (SimpleAgent)
+    Theta_new,      # new trained model (SimpleAgent)
+    K=20,
+    r=8,
+    beta=0.9,
+    eta=1e-2,
+    clip_eps=1e-8,
+):
+    """
+    Dual Orthogonal Projection merge tailored to SimpleAgent-like models.
+    Returns a SimpleAgent instance with merged parameters.
+    """
+    # device/dtype
+    device = next(Theta_old.parameters()).device
+    dtype = next(Theta_old.parameters()).dtype
+
+    state0 = Theta0.state_dict()
+    state_old = Theta_old.state_dict()
+    state_new = Theta_new.state_dict()
+
+    merged = type(Theta_old)(Theta_old.obs_dim, Theta_old.act_dim).to(device)
+    # merged.reset_heads()  # uncomment if you want freshly initialized heads
+
+    merged_state = merged.state_dict()
+
+    for name in merged_state.keys():
+        W0 = state0.get(name, None)
+        Wold = state_old[name].to(device=device, dtype=dtype)
+        Wnew = state_new.get(name, None)
+        if Wnew is None:
+            merged_state[name] = Wold.clone()
+            continue
+        Wnew = Wnew.to(device=device, dtype=dtype)
+
+        # treat 2D tensors as linear weights eligible for SVD-based merge
+        if Wold.ndim == 2 and Wnew.ndim == 2 and (W0 is not None and getattr(W0, "ndim", 0) == 2):
+            W0 = W0.to(device=device, dtype=dtype)
+
+            tau_old = (Wold - W0).detach()
+            tau_new = (Wnew - W0).detach()
+
+            Uo, So, Vo = _top_r_svd(tau_old, r)
+            Un, Sn, Vn = _top_r_svd(tau_new, r)
+
+            Wstar = ((Wold + Wnew) / 2.0).clone().to(device=device, dtype=dtype)
+
+            alpha_s_prev = 0.5
+            alpha_p_prev = 0.5
+
+            for k in range(K):
+                Wstar.requires_grad_(True)
+
+                delta_old = Wstar - Wold
+                delta_new = Wstar - Wnew
+
+                proj_old = _project_onto_svd_subspace(delta_old, Uo, Vo)
+                proj_new = _project_onto_svd_subspace(delta_new, Un, Vn)
+
+                Ls = 0.5 * torch.sum((delta_old - proj_old) ** 2)
+                Lp = 0.5 * torch.sum((delta_new - proj_new) ** 2)
+
+                grad_Ls = torch.autograd.grad(Ls, Wstar, retain_graph=False, create_graph=False)[0]
+                grad_Lp = torch.autograd.grad(Lp, Wstar, retain_graph=False, create_graph=False)[0]
+
+                g_s = grad_Ls.detach().view(-1)
+                g_p = grad_Lp.detach().view(-1)
+                diff = g_s - g_p
+                denom = (diff @ diff).clamp_min(clip_eps)
+                numer = ((g_p - g_s) @ g_p)
+                alpha_k = float((numer / denom).clamp(0.0, 1.0))
+
+                alpha_s_k = beta * alpha_s_prev + (1.0 - beta) * alpha_k
+                alpha_p_k = beta * alpha_p_prev + (1.0 - beta) * (1.0 - alpha_k)
+
+                gk = alpha_s_k * grad_Ls + alpha_p_k * grad_Lp
+
+                with torch.no_grad():
+                    Wstar = (Wstar - eta * gk).detach().to(device=device, dtype=dtype)
+
+                alpha_s_prev = alpha_s_k
+                alpha_p_prev = alpha_p_k
+
+            merged_state[name] = Wstar.clone().detach()
+
+        else:
+            # fallback: simple average for biases and non-2D params
+            merged_state[name] = ((Wold + Wnew) / 2.0).clone().to(device=device, dtype=dtype)
+
+    # load merged state
+    merged.load_state_dict(merged_state)
+    return merged
 
 
   
