@@ -14,7 +14,7 @@ import tyro
 import pathlib
 from torch.utils.tensorboard import SummaryWriter
 from typing import Literal, Optional, Tuple
-from models import shared, SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent
+from models import shared, SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent,DiffusionAgent
 from models.sequential_merge import SequentialMergeAgent
 from tasks import get_task, get_task_name
 from stable_baselines3.common.buffers import ReplayBuffer
@@ -22,7 +22,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 
 @dataclass
 class Args:
-    model_type: Literal["simple", "finetune", "componet", "packnet", "prognet", "sequential-merge"]
+    model_type: Literal["simple", "finetune", "componet", "packnet", "prognet", "sequential-merge", "diffusion"]
     """The name of the NN model to use for the agent"""
     save_dir: Optional[str] = None
     """If provided, the model will be saved in the given directory"""
@@ -81,7 +81,7 @@ class Args:
     """noise clip parameter of the Target Policy Smoothing Regularization"""
     alpha: float = 0.2
     """Entropy regularization coefficient."""
-    autotune: bool = True
+    autotune: bool = False
     """automatic tuning of the entropy coefficient"""
 
 
@@ -146,18 +146,23 @@ class Actor(nn.Module):
         return mean, log_std
 
     def get_action(self, x, **kwargs):
-        mean, log_std = self(x, **kwargs)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale + self.action_bias
-        log_prob = normal.log_prob(x_t)
-        # Enforcing Action Bound
-        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
-        mean = torch.tanh(mean) * self.action_scale + self.action_bias
-        return action, log_prob, mean
+        if isinstance(self.model, DiffusionAgent):
+            # diffusion returns raw actions (already scaled if you passed envs)
+            return self.model.get_action(x, temperature=1.0), None, None
+        else:
+            # old Gaussian path
+            mean, log_std = self(x, **kwargs)
+            std = log_std.exp()
+            normal = torch.distributions.Normal(mean, std)
+            x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
+            y_t = torch.tanh(x_t)
+            action = y_t * self.action_scale + self.action_bias
+            log_prob = normal.log_prob(x_t)
+            # Enforcing Action Bound
+            log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+            log_prob = log_prob.sum(1, keepdim=True)
+            mean = torch.tanh(mean) * self.action_scale + self.action_bias
+            return action, log_prob, mean
 
 
 @torch.no_grad()
@@ -169,7 +174,11 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
     for _ in range(num_evals):
         while True:
             obs = torch.Tensor(obs).to(device).unsqueeze(0)
-            _, _, action = agent.get_action(obs)
+            # Handle diffusion and non-diffusion agents correctly
+            if isinstance(agent.model, DiffusionAgent):
+                action = agent.get_action(obs)
+            else:
+                action, _, _ = agent.get_action(obs)
             obs, reward, termination, truncation, info = test_env.step(
                 action[0].cpu().numpy()
             )
@@ -234,6 +243,7 @@ if __name__ == "__main__":
 
     # select the model to use as the agent
     obs_dim = np.array(envs.single_observation_space.shape).prod()
+    # print(obs_dim, "obs dim", envs.single_observation_space)
     act_dim = np.prod(envs.single_action_space.shape)
     print(f"*** Loading model `{args.model_type}` ***")
     if args.model_type in ["finetune", "componet"]:
@@ -285,6 +295,15 @@ if __name__ == "__main__":
         # Sequential-merge: for each task, always train a new model first, then merge after training
         model = SimpleAgent(obs_dim=obs_dim, act_dim=act_dim).to(device)
 
+    elif args.model_type == "diffusion":
+            model = DiffusionAgent(
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                hidden_dim=256,
+                depth=4,
+                embed_dim=128,
+                T=50,               # you can reduce to 5-10 for faster sampling
+            ).to(device)
 
     actor = Actor(envs, model).to(device)
     qf1 = SoftQNetwork(envs).to(device)
@@ -341,6 +360,8 @@ if __name__ == "__main__":
             else:
                 actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
             actions = actions.detach().cpu().numpy()
+            actions = np.array(actions)
+            actions = np.atleast_1d(actions)
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
@@ -356,7 +377,7 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
-
+        
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
@@ -378,9 +399,13 @@ if __name__ == "__main__":
                 total_update_steps += 1
                 data = rb.sample(args.batch_size)
                 with torch.no_grad():
-                    next_state_actions, next_state_log_pi, _ = actor.get_action(
-                        data.next_observations
-                    )
+                    
+                    if isinstance(actor.model, DiffusionAgent):
+                        next_state_actions = actor.model.get_action(data.next_observations, temperature=1.0)
+                        next_state_log_pi = torch.zeros((data.rewards.shape[0], 1), device=device)
+                    else:
+                        next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
+
                     qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                     qf2_next_target = qf2_target(data.next_observations, next_state_actions)
                     min_qf_next_target = (
@@ -404,11 +429,29 @@ if __name__ == "__main__":
 
                 if total_update_steps % args.policy_frequency == 0:
                     for _ in range(args.policy_frequency):
-                        pi, log_pi, _ = actor.get_action(data.observations)
-                        qf1_pi = qf1(data.observations, pi)
-                        qf2_pi = qf2(data.observations, pi)
-                        min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                        actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+                        if isinstance(actor.model, DiffusionAgent):
+                            # ------------------- Diffusion denoising loss -------------------
+                            batch_size = data.actions.shape[0]
+                            t = torch.randint(0, actor.model.T, (batch_size,), device=device)          # random timestep
+                            noise = torch.randn_like(data.actions)
+
+                            # Forward diffusion: q(a_t | a_0)
+                            sqrt_alph_cumprod_t = actor.model.alpha_hats[t].sqrt()[:, None]
+                            sqrt_one_minus_alph_cumprod_t = (1.0 - actor.model.alpha_hats[t]).sqrt()[:, None]
+                            noisy_actions = sqrt_alph_cumprod_t * data.actions + sqrt_one_minus_alph_cumprod_t * noise
+
+                            # Predict noise
+                            eps_pred = actor.model(noisy_actions, data.observations, t.float() / actor.model.T)
+
+                            actor_loss = F.mse_loss(eps_pred, noise)
+                            # ------------------------------------------------------------------
+                        else:
+                            # Original Gaussian SAC loss (unchanged)
+                            pi, log_pi, _ = actor.get_action(data.observations)
+                            qf1_pi = qf1(data.observations, pi)
+                            qf2_pi = qf2(data.observations, pi)
+                            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                            actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
                         actor_optimizer.zero_grad()
                         actor_loss.backward()
@@ -422,14 +465,23 @@ if __name__ == "__main__":
                         if args.autotune:
                             with torch.no_grad():
                                 _, log_pi, _ = actor.get_action(data.observations)
-                            alpha_loss = (
-                                -log_alpha.exp() * (log_pi + target_entropy)
-                            ).mean()
 
-                            a_optimizer.zero_grad()
-                            alpha_loss.backward()
-                            a_optimizer.step()
-                            alpha = log_alpha.exp().item()
+                            if log_pi is not None:  # Gaussian policy → normal SAC autotune
+                                alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+
+                                a_optimizer.zero_grad()
+                                alpha_loss.backward()
+                                a_optimizer.step()
+                                alpha = log_alpha.exp().item()
+                            else:  # Diffusion policy → no analytical log_prob exists
+                                # Keep alpha fixed (diffusion already stochastic via sampling temperature)
+                                alpha = 0.0
+                        else:
+                            alpha = args.alpha
+
+                        # Force alpha = 0 for diffusion even if autotune is off (optional but recommended)
+                        if isinstance(actor.model, DiffusionAgent):
+                            alpha = 0.0
 
                 # update the target networks
                 if total_update_steps % args.target_network_frequency == 0:

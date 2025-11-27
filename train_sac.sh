@@ -23,7 +23,7 @@ conda activate componet
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-ALGORITHM="simple"
+ALGORITHM="diffusion"
 SEEDS=(0 1 2 3 4 5 6 7)
 SCRIPT=/data/home/co/coimd/componet/experiments/meta-world/run_experiments.py
 
@@ -34,7 +34,7 @@ for i in "${!SEEDS[@]}"; do
 
     echo "Launching seed $SEED on GPU $GPU_ID"
 
-    LOGFILE="logs_seed${SEED}_${ALGORITHM}.out"
+    LOGFILE="logs_seed${SEED}_${ALGORITHM}_2M.out"
     {
         echo "Log for seed $SEED started at: $(date)"
         echo "GPU: $GPU_ID"

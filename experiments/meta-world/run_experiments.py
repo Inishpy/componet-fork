@@ -19,7 +19,8 @@ def parse_args():
             "from-scratch",
             "prognet",
             "packnet",
-            "sequential-merge"
+            "sequential-merge",
+            "diffusion"
         ],
         required=True,
     )
