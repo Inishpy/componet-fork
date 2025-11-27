@@ -23,8 +23,8 @@ conda activate componet
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-ALGORITHM="simple"
-SEEDS=(0 1 2 3 4 5 6 7)
+ALGORITHM="sequential-merge"
+SEEDS=(0)
 SCRIPT=/data/home/co/coimd/componet/experiments/meta-world/run_experiments.py
 
 # Launch 8 runs, 2 per GPU

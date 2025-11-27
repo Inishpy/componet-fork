@@ -480,7 +480,7 @@ if __name__ == "__main__":
         print("[SEQUENTIAL-MERGE] Merging previous and current (trained) model with DOP merge ...")
         # Theta0: you need a base pretrained model. If not available use prev_model as a proxy.
         Theta0 = prev_model  # replace with actual base pretrained if you have it
-        merged_model = dop_merge_simple(Theta0, prev_model, actor.model, K=30, r=16, beta=0.95, eta=1e-3)
+        merged_model = dop_merge_simple(Theta0, prev_model, actor.model, K=100, r=16, beta=0.95, eta=1e-3)
         # Optionally: retrain merged_model here if desired
         actor.model.load_state_dict(merged_model.state_dict())
 
