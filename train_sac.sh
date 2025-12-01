@@ -3,9 +3,10 @@
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1            # we manage parallelism manually
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --time=48:00:00
+#SBATCH --gres=gpu:1
 #SBATCH --output=job.%j.out
 #SBATCH --error=job.%j.err
 
@@ -23,8 +24,8 @@ conda activate componet
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-ALGORITHM="diffusion"
-SEEDS=(0)
+ALGORITHM="sequential-merge"
+SEEDS=(0 1 2 3)
 SCRIPT=/data/home/co/coimd/componet/experiments/meta-world/run_experiments.py
 
 # Launch 8 runs, 2 per GPU
@@ -34,7 +35,7 @@ for i in "${!SEEDS[@]}"; do
 
     echo "Launching seed $SEED on GPU $GPU_ID"
 
-    LOGFILE="logs_seed${SEED}_${ALGORITHM}_2M.out"
+    LOGFILE="logs_seed${SEED}_${ALGORITHM}_enhanced.out"
     {
         echo "Log for seed $SEED started at: $(date)"
         echo "GPU: $GPU_ID"

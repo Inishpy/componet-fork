@@ -16,9 +16,72 @@ import pathlib
 from torch.utils.tensorboard import SummaryWriter
 from typing import Literal, Optional, Tuple
 from models import shared, SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent,DiffusionAgent
-from models.sequential_merge import SequentialMergeAgent
+# from models.sequential_merge import SequentialMergeAgent
 from tasks import get_task, get_task_name
 from stable_baselines3.common.buffers import ReplayBuffer
+import logging
+from queue import deque
+
+class StateBuffer:
+    """
+    Buffer to collect and store state samples for policy-aware merging.
+    Stores diverse states encountered during training.
+    """
+    def __init__(self, max_size=100000, obs_dim=None):
+        self.max_size = max_size
+        self.obs_dim = obs_dim
+        self.buffer = deque(maxlen=max_size)
+        
+    def add(self, state):
+        """Add a single state to the buffer"""
+        if isinstance(state, np.ndarray):
+            state = torch.from_numpy(state).float()
+        self.buffer.append(state)
+    
+    def add_batch(self, states):
+        """Add a batch of states to the buffer"""
+        if isinstance(states, np.ndarray):
+            states = torch.from_numpy(states).float()
+        for state in states:
+            self.buffer.append(state)
+    
+    def sample(self, batch_size):
+        """Sample a batch of states"""
+        if len(self.buffer) == 0:
+            return None
+        
+        batch_size = min(batch_size, len(self.buffer))
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        samples = [self.buffer[i] for i in indices]
+        return torch.stack(samples)
+    
+    def get_all(self):
+        """Get all states in the buffer"""
+        if len(self.buffer) == 0:
+            return None
+        return torch.stack(list(self.buffer))
+    
+    def __len__(self):
+        return len(self.buffer)
+    
+    def save(self, filepath):
+        """Save buffer to disk"""
+        if len(self.buffer) > 0:
+            states = torch.stack(list(self.buffer))
+            torch.save(states, filepath)
+            print(f"Saved {len(self.buffer)} states to {filepath}")
+    
+    @staticmethod
+    def load(filepath):
+        """Load buffer from disk"""
+        if os.path.exists(filepath):
+            states = torch.load(filepath)
+            buffer = StateBuffer(max_size=len(states))
+            for state in states:
+                buffer.add(state)
+            print(f"Loaded {len(buffer)} states from {filepath}")
+            return buffer
+        return None
 
 
 @dataclass
@@ -84,6 +147,29 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = False
     """automatic tuning of the entropy coefficient"""
+
+
+    # State buffer arguments for enhanced DOP merge
+    state_buffer_size: int = 5000
+    """Maximum number of states to store for policy-aware merging"""
+    state_buffer_sample_freq: int = 10
+    """Sample states every N steps"""
+    use_enhanced_merge: bool = True
+    """Use enhanced DOP merge with policy and Fisher terms"""
+    
+    # DOP merge hyperparameters
+    dop_K: int = 50
+    """Number of optimization iterations for DOP merge"""
+    dop_r: int = 16
+    """Rank for SVD approximation"""
+    dop_beta: float = 0.95
+    """Momentum parameter for alpha smoothing"""
+    dop_eta: float = 1e-3
+    """Learning rate for DOP optimization"""
+    dop_lambda_kl: float = 0.1
+    """Weight for KL divergence term"""
+    dop_lambda_f: float = 0.01
+    """Weight for Fisher information term"""
 
 
 def make_env(task_id):
@@ -154,6 +240,12 @@ class Actor(nn.Module):
             # old Gaussian path
             mean, log_std = self(x, **kwargs)
             std = log_std.exp()
+            # Debug: log mean and std for nan
+            if torch.isnan(mean).any() or torch.isnan(std).any():
+                print("[DEBUG] NaN detected in mean or std in get_action")
+                print(f"mean: {mean}")
+                print(f"log_std: {log_std}")
+                print(f"std: {std}")
             normal = torch.distributions.Normal(mean, std)
             x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
             y_t = torch.tanh(x_t)
@@ -246,6 +338,24 @@ if __name__ == "__main__":
     obs_dim = np.array(envs.single_observation_space.shape).prod()
     # print(obs_dim, "obs dim", envs.single_observation_space)
     act_dim = np.prod(envs.single_action_space.shape)
+
+
+
+    # Initialize state buffer for current task
+    state_buffer_current = StateBuffer(max_size=1000, obs_dim=obs_dim)
+    state_buffer_prev = None
+    
+    # Load previous state buffer if available
+    if args.task_id > 0 and len(args.prev_units) > 0 and args.use_enhanced_merge:
+        prev_buffer_path = f"{args.prev_units[0]}/state_buffer.pt"
+        if os.path.exists(prev_buffer_path):
+            state_buffer_prev = StateBuffer.load(prev_buffer_path)
+            print(f"Loaded previous state buffer with {len(state_buffer_prev)} states")
+        else:
+            print(f"Warning: Previous state buffer not found at {prev_buffer_path}")
+
+
+
     print(f"*** Loading model `{args.model_type}` ***")
     if args.model_type in ["finetune", "componet"]:
         assert (
@@ -293,8 +403,15 @@ if __name__ == "__main__":
             map_location=device,
         ).to(device)
     elif args.model_type == "sequential-merge":
-        # Sequential-merge: for each task, always train a new model first, then merge after training
-        model = SimpleAgent(obs_dim=obs_dim, act_dim=act_dim).to(device)
+        if args.task_id > 0 and len(args.prev_units) > 0:
+            try:
+                model = SimpleAgent.load(args.prev_units[0], map_location=device, reset_heads=False).to(device)
+                print(f"Loaded previous model from {args.prev_units[0]}")
+            except Exception as e:
+                logging.info(f"Error loading previous model: {e}")
+                model = SimpleAgent(obs_dim=obs_dim, act_dim=act_dim).to(device)
+        else:
+            model = SimpleAgent(obs_dim=obs_dim, act_dim=act_dim).to(device)
 
     elif args.model_type == "diffusion":
             model = DiffusionAgent(
@@ -363,7 +480,9 @@ if __name__ == "__main__":
             actions = actions.detach().cpu().numpy()
             actions = np.array(actions)
             actions = np.atleast_1d(actions)
-
+        # Collect states for state buffer (periodically)
+        if global_step % args.state_buffer_sample_freq == 0:
+            state_buffer_current.add_batch(obs)
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
@@ -523,18 +642,127 @@ if __name__ == "__main__":
                     )
 
     # --- Sequential-merge post-training merge logic ---
-    if args.model_type == "sequential-merge" and args.task_id > 0 and len(args.prev_units) > 0:
-        from models.sequential_merge import dop_merge_simple
-        from models.simple import SimpleAgent
+    # if args.model_type == "sequential-merge" and args.task_id > 0 and len(args.prev_units) > 0:
+    #     from models.sequential_merge import dop_merge_simple
+    #     from models.simple import SimpleAgent
 
-        print("[SEQUENTIAL-MERGE] Loading previous model for merging ...", args.prev_units)
+    #     print("[SEQUENTIAL-MERGE] Loading previous model for merging ...", args.prev_units)
+    #     prev_model = SimpleAgent.load(args.prev_units[0], map_location=device, reset_heads=False).to(device)
+    #     print("[SEQUENTIAL-MERGE] Merging previous and current (trained) model with DOP merge ...")
+    #     # Theta0: you need a base pretrained model. If not available use prev_model as a proxy.
+    #     Theta0 = prev_model  # replace with actual base pretrained if you have it
+    #     merged_model = dop_merge_simple(Theta0, prev_model, actor.model, K=50, r=16, beta=0.95, eta=1e-3)
+    #     # Optionally: retrain merged_model here if desired
+    #     actor.model.load_state_dict(merged_model.state_dict())
+    # --- Enhanced DOP merge post-training logic ---
+    if args.model_type == "sequential-merge" and args.task_id > 0 and len(args.prev_units) > 0:
+        print("\n" + "="*60)
+        print("[ENHANCED DOP MERGE] Starting merge process...")
+        print("="*60)
+        
+        # Import the enhanced merge function
+        from models.sequential_merge import dop_merge_enhanced
+        
+        # Load previous model
+        print(f"[MERGE] Loading previous model from {args.prev_units[0]}...")
         prev_model = SimpleAgent.load(args.prev_units[0], map_location=device, reset_heads=False).to(device)
-        print("[SEQUENTIAL-MERGE] Merging previous and current (trained) model with DOP merge ...")
-        # Theta0: you need a base pretrained model. If not available use prev_model as a proxy.
-        Theta0 = prev_model  # replace with actual base pretrained if you have it
-        merged_model = dop_merge_simple(Theta0, prev_model, actor.model, K=100, r=16, beta=0.95, eta=1e-3)
-        # Optionally: retrain merged_model here if desired
+        
+        # Always load the first trained model of the first task as Theta0, where the first task is determined by start_mode
+        import glob
+        import re
+        first_task_model_path = None
+        start_mode_id = None
+        if args.save_dir is not None:
+            # Find all task directories in save_dir matching the experiment naming convention
+            pattern = f"{args.save_dir}/task_*__*__{args.exp_name}__{args.seed}"
+            candidates = glob.glob(pattern)
+            # Extract task ids
+            task_ids = []
+            for c in candidates:
+                m = re.search(r"task_(\d+)__", c)
+                if m:
+                    task_ids.append(int(m.group(1)))
+            if task_ids:
+                start_mode_id = min(task_ids)
+                # Find the path for the minimum task id
+                for c in candidates:
+                    if f"task_{start_mode_id}__" in c:
+                        first_task_model_path = c
+                        break
+        if not first_task_model_path and len(args.prev_units) > 0:
+            # Fallback: try to infer from prev_units path
+            prev_path = str(args.prev_units[0])
+            m = re.search(r"task_(\d+)__", prev_path)
+            if m:
+                # Try to replace with the minimum task id found above, else fallback to 0
+                min_id = start_mode_id if start_mode_id is not None else 0
+                first_task_model_path = re.sub(r"task_\d+__", f"task_{min_id}__", prev_path)
+            else:
+                first_task_model_path = prev_path
+        print(f"[MERGE] Loading first task model as Theta0 from {first_task_model_path} ...")
+        Theta0 = SimpleAgent.load(first_task_model_path, map_location=device, reset_heads=False).to(device)
+        
+        # Get state samples
+        states_old = None
+        states_new = None
+        
+        if True: #args.use_enhanced_merge:
+            print(f"[MERGE] Preparing state samples for policy-aware merging...")
+            
+            # Sample states from previous task buffer
+            if state_buffer_prev is not None and len(state_buffer_prev) > 0:
+                states_old = state_buffer_prev.sample(min(1000, len(state_buffer_prev)))
+                states_old = states_old.to(device)
+                print(f"[MERGE] Sampled {states_old.shape[0]} states from previous task")
+            else:
+                print("[MERGE] Warning: No previous task states available")
+            
+            # Sample states from current task buffer
+            if len(state_buffer_current) > 0:
+                states_new = state_buffer_current.sample(min(1000, len(state_buffer_current)))
+                states_new = states_new.to(device)
+                print(f"[MERGE] Sampled {states_new.shape[0]} states from current task")
+            else:
+                print("[MERGE] Warning: No current task states available")
+        
+        # Perform enhanced DOP merge
+        print(f"[MERGE] Performing enhanced DOP merge with:")
+        print(f"  - K={args.dop_K} iterations")
+        print(f"  - r={args.dop_r} rank")
+        print(f"  - λ_kl={args.dop_lambda_kl}")
+        print(f"  - λ_f={args.dop_lambda_f}")
+        
+        merged_model = dop_merge_enhanced(
+            Theta0=Theta0,
+            Theta_old=prev_model,
+            Theta_new=actor.model,
+            states_old=states_old,
+            states_new=states_new,
+            K=args.dop_K,
+            r=args.dop_r,
+            beta=args.dop_beta,
+            eta=args.dop_eta,
+            lambda_kl=args.dop_lambda_kl if args.use_enhanced_merge else 0.0,
+            lambda_f=args.dop_lambda_f if args.use_enhanced_merge else 0.0,
+            use_policy_terms=args.use_enhanced_merge,
+        )
+        
+        print("[MERGE] Merge complete! Loading merged weights into actor...")
         actor.model.load_state_dict(merged_model.state_dict())
+        print("="*60 + "\n")
+        # Debug: check for NaNs in merged model output
+        test_states = None
+        if states_new is not None:
+            test_states = states_new[:5]
+        elif states_old is not None:
+            test_states = states_old[:5]
+        if test_states is not None:
+            with torch.no_grad():
+                mean, log_std = actor.model(test_states)
+                if torch.isnan(mean).any() or torch.isnan(log_std).any():
+                    print("[DEBUG] NaN detected in merged model output after merge")
+                    print(f"mean: {mean}")
+                    print(f"log_std: {log_std}")
 
     # Evaluate on all previous tasks and print/average results
     all_returns = []
@@ -554,9 +782,18 @@ if __name__ == "__main__":
     envs.close()
     writer.close()
 
+    # Save model and state buffer
     if args.save_dir is not None:
-        print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
-        actor.model.save(dirname=f"{args.save_dir}/{run_name}")
+        save_path = f"{args.save_dir}/{run_name}"
+        print(f"[SAVE] Saving trained agent to {save_path}")
+        actor.model.save(dirname=save_path)
+        
+        # Save state buffer for future merging
+        if args.use_enhanced_merge and len(state_buffer_current) > 0:
+            buffer_path = f"{save_path}/state_buffer.pt"
+            state_buffer_current.save(buffer_path)
+            print(f"[SAVE] Saved state buffer with {len(state_buffer_current)} states")
+
 
     # Log training duration
     end_time = time.time()
