@@ -72,7 +72,7 @@ for i, task_id in enumerate(modes[first_idx:]):
                 params += f" --prev-units {save_root}/{run_name(task_id-1)}"
 
     # Launch experiment
-    cmd = f"/data/home/co/coimd/componet/experiments/meta-world/run_sac.py {params}"
+    cmd = f"./run_sac.py {params}"
     print(cmd)
 
     if not args.no_run:

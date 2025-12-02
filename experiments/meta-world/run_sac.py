@@ -342,17 +342,22 @@ if __name__ == "__main__":
 
 
     # Initialize state buffer for current task
-    state_buffer_current = StateBuffer(max_size=1000, obs_dim=obs_dim)
-    state_buffer_prev = None
-    
-    # Load previous state buffer if available
+    state_buffer_current = StateBuffer(max_size=10000, obs_dim=obs_dim)
+    state_buffers_prev = []
+
+    # Load all previous state buffers if available
     if args.task_id > 0 and len(args.prev_units) > 0 and args.use_enhanced_merge:
-        prev_buffer_path = f"{args.prev_units[0]}/state_buffer.pt"
-        if os.path.exists(prev_buffer_path):
-            state_buffer_prev = StateBuffer.load(prev_buffer_path)
-            print(f"Loaded previous state buffer with {len(state_buffer_prev)} states")
-        else:
-            print(f"Warning: Previous state buffer not found at {prev_buffer_path}")
+        for prev_unit in args.prev_units:
+            prev_buffer_path = f"{prev_unit}/state_buffer.pt"
+            if os.path.exists(prev_buffer_path):
+                buf = StateBuffer.load(prev_buffer_path)
+                if buf is not None and len(buf) > 0:
+                    state_buffers_prev.append(buf)
+                    print(f"Loaded previous state buffer with {len(buf)} states from {prev_buffer_path}")
+                else:
+                    print(f"Warning: Previous state buffer at {prev_buffer_path} is empty or failed to load")
+            else:
+                print(f"Warning: Previous state buffer not found at {prev_buffer_path}")
 
 
 
@@ -710,16 +715,24 @@ if __name__ == "__main__":
             print(f"[MERGE] Preparing state samples for policy-aware merging...")
             
             # Sample states from previous task buffer
-            if state_buffer_prev is not None and len(state_buffer_prev) > 0:
-                states_old = state_buffer_prev.sample(min(1000, len(state_buffer_prev)))
-                states_old = states_old.to(device)
-                print(f"[MERGE] Sampled {states_old.shape[0]} states from previous task")
-            else:
-                print("[MERGE] Warning: No previous task states available")
+            if state_buffers_prev is not None and len(state_buffers_prev) > 0:
+                # Sample 1000 from each previous buffer and concatenate
+                sampled_states = []
+                for buf in state_buffers_prev:
+                    if len(buf) > 0:
+                        s = buf.sample(min(2000, len(buf)))
+                        if s is not None:
+                            sampled_states.append(s)
+                if len(sampled_states) > 0:
+                    states_old = torch.cat(sampled_states, dim=0).to(device)
+                    print(f"[MERGE] Sampled {states_old.shape[0]} states from all previous task buffers")
+                else:
+                    states_old = None
+                    print("[MERGE] Warning: No previous task states available")
             
             # Sample states from current task buffer
             if len(state_buffer_current) > 0:
-                states_new = state_buffer_current.sample(min(1000, len(state_buffer_current)))
+                states_new = state_buffer_current.sample(min(2000, len(state_buffer_current)))
                 states_new = states_new.to(device)
                 print(f"[MERGE] Sampled {states_new.shape[0]} states from current task")
             else:
