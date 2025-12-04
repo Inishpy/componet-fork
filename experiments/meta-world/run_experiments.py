@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--no-run", default=False, action="store_true")
 
-    parser.add_argument("--start-mode", default=2, type=int, required=False)
+    parser.add_argument("--start-mode", default=1, type=int, required=False)
     parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to use")
     return parser.parse_args()
 
@@ -72,7 +72,7 @@ for i, task_id in enumerate(modes[first_idx:]):
                 params += f" --prev-units {save_root}/{run_name(task_id-1)}"
 
     # Launch experiment
-    cmd = f"./run_sac.py {params}"
+    cmd = f"/data/home/co/coimd/componet/experiments/meta-world/run_sac.py {params}"
     print(cmd)
 
     if not args.no_run:

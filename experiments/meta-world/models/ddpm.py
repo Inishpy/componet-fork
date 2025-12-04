@@ -188,7 +188,7 @@ class DiffusionAgent(nn.Module):
         # If you trained on raw actions, remove tanh
         x = torch.tanh(x)
 
-        return x.squeeze(0) if batch_size == 1 else x
+        return x
 
     def save(self, dirname: str):
         os.makedirs(dirname, exist_ok=True)

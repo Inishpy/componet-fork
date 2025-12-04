@@ -35,14 +35,14 @@ for i in "${!SEEDS[@]}"; do
 
     echo "Launching seed $SEED on GPU $GPU_ID"
 
-    LOGFILE="logs_seed${SEED}_${ALGORITHM}_enhanced.out"
+    LOGFILE="logs_seed${SEED}_${ALGORITHM}_enhanced_easytasks.out"
     {
         echo "Log for seed $SEED started at: $(date)"
         echo "GPU: $GPU_ID"
         echo ""
     } >> "$LOGFILE"
 
-    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    CUDA_VISIBLE_DEVICES=0 \
     python3 $SCRIPT \
         --algorithm $ALGORITHM \
         --seed $SEED \

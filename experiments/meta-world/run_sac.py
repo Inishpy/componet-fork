@@ -235,21 +235,44 @@ class Actor(nn.Module):
     def get_action(self, x, **kwargs):
         if isinstance(self.model, DiffusionAgent):
             # diffusion returns raw actions (already scaled if you passed envs)
-            return self.model.get_action(x, temperature=1.0), None, None
+            action = self.model.get_action(x, temperature=1.0)
+            # Check for NaN, Inf, or huge values in diffusion output
+            if torch.isnan(action).any() or torch.isinf(action).any() or (action.abs() > 1e6).any():
+                print("[ERROR] Invalid action detected in DiffusionAgent.get_action: NaN, Inf, or huge value")
+                print(f"action: {action}")
+                # Optionally, clip or zero out invalid actions
+                action = torch.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+                action = torch.clamp(action, -1e6, 1e6)
+            return action, None, None
         else:
             # old Gaussian path
             mean, log_std = self(x, **kwargs)
             std = log_std.exp()
-            # Debug: log mean and std for nan
-            if torch.isnan(mean).any() or torch.isnan(std).any():
-                print("[DEBUG] NaN detected in mean or std in get_action")
+            # Debug: log mean and std for nan/inf/huge
+            if (
+                torch.isnan(mean).any() or torch.isnan(std).any() or
+                torch.isinf(mean).any() or torch.isinf(std).any() or
+                (mean.abs() > 1e6).any() or (std.abs() > 1e6).any()
+            ):
+                print("[ERROR] Invalid mean or std in get_action: NaN, Inf, or huge value")
                 print(f"mean: {mean}")
                 print(f"log_std: {log_std}")
                 print(f"std: {std}")
+                # Optionally, clip or zero out invalid values
+                mean = torch.nan_to_num(mean, nan=0.0, posinf=0.0, neginf=0.0)
+                std = torch.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0)
+                mean = torch.clamp(mean, -1e6, 1e6)
+                std = torch.clamp(std, 1e-6, 1e6)
             normal = torch.distributions.Normal(mean, std)
             x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
             y_t = torch.tanh(x_t)
             action = y_t * self.action_scale + self.action_bias
+            # Check for NaN, Inf, or huge values in action
+            if torch.isnan(action).any() or torch.isinf(action).any() or (action.abs() > 1e6).any():
+                print("[ERROR] Invalid action sampled: NaN, Inf, or huge value")
+                print(f"action: {action}")
+                action = torch.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+                action = torch.clamp(action, -1e6, 1e6)
             log_prob = normal.log_prob(x_t)
             # Enforcing Action Bound
             log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
@@ -467,6 +490,12 @@ if __name__ == "__main__":
     obs, _ = envs.reset(seed=args.seed)
     global_step = 0
     total_update_steps = 0
+
+    # --- Early stopping based on consecutive successes ---
+    consecutive_successes = 0
+    required_consecutive_successes = 5  # Stop after 5 consecutive successes
+    early_stop_triggered = False
+
     while global_step < args.total_timesteps:
         # ALGO LOGIC: put action logic here
         if global_step < args.random_actions_end:
@@ -488,6 +517,7 @@ if __name__ == "__main__":
         # Collect states for state buffer (periodically)
         if global_step % args.state_buffer_sample_freq == 0:
             state_buffer_current.add_batch(obs)
+            
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
@@ -517,6 +547,17 @@ if __name__ == "__main__":
                         "charts/episodic_length", info["episode"]["l"], global_step
                     )
                     writer.add_scalar("charts/success", info["success"], global_step)
+                    # --- Early stopping logic: check for consecutive successes ---
+                    if info.get("success", 0) == 1:
+                        consecutive_successes += 1
+                        if consecutive_successes >= required_consecutive_successes:
+                            print(f"Early stopping: {required_consecutive_successes} consecutive successes achieved at global_step={global_step}")
+                            early_stop_triggered = True
+                            break
+                    else:
+                        consecutive_successes = 0
+            if early_stop_triggered:
+                break
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:

@@ -10,3 +10,5 @@ experiments/meta-world/data
 *.err
 
 *.log
+
+MUJOCO_LOG.TXT
